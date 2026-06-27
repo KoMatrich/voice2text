@@ -10,3 +10,8 @@ dependencies = [
     "pynput>=1.8.2",
     "sounddevice>=0.5.5",
 ]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.21.0",
+]
