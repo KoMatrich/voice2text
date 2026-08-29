@@ -24,9 +24,9 @@ RESTORE_CLIPBOARD = False  # restoring races the paste; opt in if you want it
 # Our own virtual keyboard advertises every key code, so it would otherwise be
 # picked up by the listener's own device scan.
 UINPUT_NAME = "voice2text"
-MODEL_SIZE = "medium.en"  # Options: tiny, base, small, medium, large (and .en variants)
+MODEL_SIZE = "medium.large"  # Options: tiny, base, small, medium, large (and .en variants)
 SAMPLE_RATE = 16000
-MIN_AUDIO_SEC = 0.5
+MIN_AUDIO_SEC = 0.75
 # How long to stay idle before dropping the model (~1.9 GB of VRAM on this 4 GB
 # card) and closing the microphone. Reacquiring both costs ~1.8 s, and that is
 # hidden under the next recording because the load starts on key press.
