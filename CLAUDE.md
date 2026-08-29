@@ -1,33 +1,88 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Push-to-talk Whisper dictation for NixOS. Hold right Shift, speak, release —
+the transcript is typed into the focused window.
 
-## Running the app
+## Running
 
 ```bash
-uv run main.py
+nix run .            # the packaged app
+nix develop          # then: python main.py, for hacking on main.py
 ```
 
-Dependencies are managed with `uv`. To add packages: `uv add <package>`.
+The flake builds a self-contained Python env — no `uv`, no `.venv`. On boot the
+app runs as a systemd user service via `homeModules.default`, imported from
+`/etc/nixos/home.nix` (`services.voice2text.enable = true`). Because that input
+is `git+file://`, `main.py` must be committed before `nh os switch` picks it up.
+
+Installing the package is also what GC-roots cuDNN. Without it, `nh clean`
+collects it and the next launch spends ~6 min re-fetching 900 MB.
 
 ## Architecture
 
-Single-file app (`main.py`). The `DictationApp` class owns everything:
+Single file (`main.py`), one `DictationApp`. Nothing is acquired until it is
+needed:
 
-**Startup sequence** — `__init__` builds the tkinter UI, then spawns a daemon thread to load the Whisper model (`load_model`). Model load tries GPU (`cuda/float16`) first, falls back to CPU (`int8`). After load, `load_model` also starts the `sounddevice` input stream and the `pynput` keyboard listener — both run for the lifetime of the process.
+- **Idle** — only the hidden Tk window and the `pynput` listener exist. No
+  model, no microphone.
+- **Key press** — `_acquire()` opens the audio stream (~25 ms) and kicks off
+  `_ensure_model()` on a background thread, so the ~1.8 s model load overlaps
+  with the user speaking rather than following it.
+- **Key release** — a daemon thread waits on `_model_ready`, transcribes with
+  streaming segments, and types via `pynput.keyboard.Controller`. Clips shorter
+  than `MIN_AUDIO_SEC` are dropped.
+- **After `IDLE_RELEASE_SEC`** — `_release_resources()` drops the model and
+  closes the stream, returning ~1.9 GB of VRAM and clearing GNOME's
+  "microphone in use" indicator.
 
-**Push-to-talk loop** — `pynput` listener fires `on_press`/`on_release` on `PUSH_TO_TALK_KEY` (default: right Shift). Press starts recording into `audio_buffer` via the `sounddevice` callback. Release stops recording and spawns a daemon thread for `transcribe_and_type`.
+`_set_state(state, text)` is the only path to a visual change:
+`ready → recording → (loading) → transcribing → done → ready`. Presses, audio
+callbacks and transcription all run off the main thread, so **every** Tk call
+from them goes through `root.after(0, ...)` — including `after_cancel`.
 
-**Transcription** — `transcribe_and_type` concatenates the buffer, calls `faster_whisper` with streaming segments, and types the result directly into the active window via `pynput.keyboard.Controller`. Minimum audio length is 0.5 s; shorter clips are silently discarded.
+`self.model` is written by the loader thread, read by the transcription thread
+and cleared from the Tk thread; all three go through `_model_lock`, and readers
+take a local reference. `_is_busy` serialises transcriptions. `_ensure_model`
+always sets `_model_ready`, even on failure, or a waiter would hang forever
+with `_is_busy` stuck true.
 
-**UI / state machine** — `_set_state(state, text)` drives all visual changes. States: `loading → ready → recording → transcribing → done → ready`. All tkinter mutations must go through `root.after(0, ...)` since they originate from non-main threads.
-
-**Threading model** — three concurrent threads beyond the main Tk thread: model-load thread, `sounddevice` audio callback thread, transcription thread. The `_is_busy` flag prevents overlapping transcriptions.
-
-## Key configuration constants (top of `main.py`)
+## Configuration (top of `main.py`)
 
 | Constant | Default | Purpose |
 |---|---|---|
 | `PUSH_TO_TALK_KEY` | `keyboard.Key.shift_r` | Trigger key |
 | `MODEL_SIZE` | `"medium.en"` | Whisper model variant |
 | `SAMPLE_RATE` | `16000` | Audio sample rate (Hz) |
+| `MIN_AUDIO_SEC` | `0.5` | Shorter clips are discarded |
+| `IDLE_RELEASE_SEC` | `90` | Idle time before freeing model + mic |
+
+## Constraints
+
+- **4 GB VRAM** (GTX 1650). `medium.en` at fp16 needs ~1.9 GB, so holding it
+  while idle is most of the card. Don't reintroduce an eager load.
+- **`pynput` runs its X11 backend** (`pynput.keyboard._xorg`) under XWayland,
+  so the hotkey only fires while an X11/XWayland window has focus. Typing via
+  XTEST works everywhere. Going compositor-independent means switching the
+  listener to `evdev`, which needs the user in the `input` group.
+- **CUDA CTranslate2 is built from source** and is in no binary cache. It is
+  pinned to `sm_75` via `CUDA_ARCH_LIST` (CTranslate2 uses CMake's legacy
+  FindCUDA path and ignores `CMAKE_CUDA_ARCHITECTURES`; the default `Auto`
+  probes for a GPU, finds none in the sandbox, and builds eight architectures).
+  Never set `config.cudaSupport` globally — `faster-whisper` pulls in
+  `onnxruntime`, which would then also build from source, for hours.
+- **Use `pkgs.python3`, never a pinned `pythonXY`.** Only the pinned nixpkgs'
+  default interpreter has a populated binary cache; any other version rebuilds
+  torch, transformers and friends from source. The version therefore moves with
+  nixpkgs: on the currently pinned rev it is 3.13.15 with CTranslate2 4.7.2,
+  and it was 3.14.7 with CTranslate2 4.8.1 one rev earlier. Don't hard-code it.
+- **Keep this flake's `nixpkgs` locked to the same rev as `/etc/nixos`.** They
+  are linked by `follows`, so a mismatch means CTranslate2 is compiled twice --
+  once here, once at `nh os switch`. Read the system rev from the node that
+  `root.inputs.nixpkgs` names, which is *not* the node literally called
+  "nixpkgs":
+
+  ```bash
+  nix eval --impure --raw --expr 'let l = builtins.fromJSON (builtins.readFile /etc/nixos/flake.lock);
+    in l.nodes.${l.nodes.root.inputs.nixpkgs}.locked.rev'
+  nix flake lock --override-input nixpkgs github:NixOS/nixpkgs/<rev>
+  ```

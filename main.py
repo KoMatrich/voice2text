@@ -1,3 +1,4 @@
+import gc
 import tkinter as tk
 import threading
 import sounddevice as sd
@@ -9,6 +10,11 @@ from pynput import keyboard
 PUSH_TO_TALK_KEY = keyboard.Key.shift_r
 MODEL_SIZE = "medium.en"  # Options: tiny, base, small, medium, large (and .en variants)
 SAMPLE_RATE = 16000
+MIN_AUDIO_SEC = 0.5
+# How long to stay idle before dropping the model (~1.9 GB of VRAM on this 4 GB
+# card) and closing the microphone. Reacquiring both costs ~1.8 s, and that is
+# hidden under the next recording because the load starts on key press.
+IDLE_RELEASE_SEC = 90
 
 # --- THEME ---
 BG_COLOR      = "#1c1c1e"
@@ -44,17 +50,27 @@ class DictationApp:
 
         # State variables
         self.model = None
+        self.stream = None
         self.is_recording = False
         self.key_pressed = False
         self.audio_buffer = []
         self._pulse_state = False
         self._pulse_job = None
         self._hide_job = None
+        self._idle_job = None
         self._is_busy = False
+        # self.model is written by the loader thread, read by the transcription
+        # thread and cleared from the Tk thread, so every touch of it is either
+        # under this lock or via a local reference taken under it.
+        self._model_lock = threading.Lock()
+        self._model_ready = threading.Event()
         self.keyboard_controller = keyboard.Controller()
 
-        self._set_state("loading")
-        threading.Thread(target=self.load_model, daemon=True).start()
+        # Nothing is acquired up front: no model, no audio stream. Only the
+        # listener, so push-to-talk is live as soon as the imports finish.
+        self._set_state("ready")
+        self.listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
+        self.listener.start()
 
     # ------------------------------------------------------------------ UI build
 
@@ -167,13 +183,7 @@ class DictationApp:
     # ---------------------------------------------------------------- state machine
 
     def _set_state(self, state: str, text: str = ""):
-        if state == "loading":
-            self.status_label.config(text="Loading model...", fg=ACCENT_PROC)
-            self.text_label.config(text="")
-            self._start_pulse(ACCENT_PROC, "#7a6500", 700)
-            self._show_window()
-
-        elif state == "ready":
+        if state == "ready":
             self._stop_pulse()
             self.dot_canvas.itemconfig(self.dot_item, fill=ACCENT_IDLE)
             self._hide_window()
@@ -188,6 +198,14 @@ class DictationApp:
             self._start_pulse(ACCENT_REC, "#7a0000", 400)
             self._show_window()
 
+        elif state == "loading":
+            # Only reached when the key was released before the model finished
+            # loading; otherwise the load is fully hidden by the recording.
+            self.status_label.config(text="Loading model...", fg=ACCENT_PROC)
+            self.text_label.config(text="")
+            self._start_pulse(ACCENT_PROC, "#7a6500", 700)
+            self._show_window()
+
         elif state == "transcribing":
             self.status_label.config(text="Transcribing...", fg=ACCENT_PROC)
             self._start_pulse(ACCENT_PROC, "#7a6500", 700)
@@ -200,29 +218,90 @@ class DictationApp:
             self.status_label.config(text="Done", fg=ACCENT_IDLE)
             self.text_label.config(text=text if text else "")
             self._hide_job = self.root.after(1400, lambda: self._set_state("ready"))
+            self._schedule_idle_release()
 
-    # ---------------------------------------------------------------- model / audio
+    # ---------------------------------------------------------------- acquire / release
 
-    def load_model(self):
+    def _acquire(self):
+        """Open the microphone and start loading the model, both on key press."""
+        # after_cancel must run on the Tk thread; we are on the listener
+        # thread here. The cancel is therefore async and can lose a race with
+        # the timer firing - _release_resources re-checks key_pressed for that.
+        self.root.after(0, self._cancel_idle_release)
+
+        if self.stream is None:
+            self.stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                callback=self.audio_callback,
+            )
+            self.stream.start()
+
+        if self.model is None:
+            # Safe to clear: on_press bails while _is_busy, so no transcription
+            # thread is waiting on the event at this point.
+            self._model_ready.clear()
+            threading.Thread(target=self._ensure_model, daemon=True).start()
+
+    def _ensure_model(self):
+        with self._model_lock:
+            try:
+                if self.model is None:
+                    try:
+                        print("Attempting to load model on GPU...")
+                        self.model = self._new_model("cuda", "float16")
+                        print("GPU loaded successfully.")
+                    except Exception as e:
+                        print(f"GPU load failed ({e}). Falling back to CPU...")
+                        self.model = self._new_model("cpu", "int8")
+                        print("CPU loaded successfully.")
+            except Exception as e:
+                print(f"Model load failed: {e}")
+            finally:
+                # Always signal, including on failure: transcribe_and_type
+                # waits on this and would otherwise hang with _is_busy stuck.
+                self._model_ready.set()
+
+    @staticmethod
+    def _new_model(device, compute_type):
         try:
-            print("Attempting to load model on GPU...")
-            self.model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
-            print("GPU loaded successfully.")
-        except Exception as e:
-            print(f"GPU load failed ({e}). Falling back to CPU...")
-            self.model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
-            print("CPU loaded successfully.")
+            # Keeps the Hugging Face Hub out of the hot path: without this every
+            # load makes a network round trip to check for a newer revision.
+            return WhisperModel(
+                MODEL_SIZE, device=device, compute_type=compute_type,
+                local_files_only=True,
+            )
+        except Exception:
+            # Not cached yet (first run, or MODEL_SIZE changed) - fetch it.
+            return WhisperModel(MODEL_SIZE, device=device, compute_type=compute_type)
 
-        self.root.after(0, lambda: self._set_state("ready"))
+    def _schedule_idle_release(self):
+        self._cancel_idle_release()
+        self._idle_job = self.root.after(IDLE_RELEASE_SEC * 1000, self._release_resources)
 
-        self.listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
-        self.listener.start()
+    def _cancel_idle_release(self):
+        if self._idle_job:
+            self.root.after_cancel(self._idle_job)
+            self._idle_job = None
 
-        self.stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            callback=self.audio_callback,
-        )
-        self.stream.start()
+    def _release_resources(self):
+        """Give back the VRAM and the microphone. Runs on the Tk thread."""
+        self._idle_job = None
+        if self.key_pressed or self._is_busy:
+            # Raced with a new press; the next 'done' reschedules us.
+            return
+
+        if self.stream is not None:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+
+        with self._model_lock:
+            self.model = None
+            self._model_ready.clear()
+        gc.collect()
+        print("Released model and microphone.")
+
+    # ---------------------------------------------------------------- audio / keys
 
     def audio_callback(self, indata, frames, time, status):
         if status:
@@ -233,8 +312,9 @@ class DictationApp:
     def on_press(self, key):
         if key == PUSH_TO_TALK_KEY and not self.key_pressed and not self._is_busy:
             self.key_pressed = True
-            self.is_recording = True
             self.audio_buffer = []
+            self._acquire()
+            self.is_recording = True
             self.root.after(0, lambda: self._set_state("recording"))
 
     def on_release(self, key):
@@ -244,19 +324,44 @@ class DictationApp:
             self._is_busy = True
             threading.Thread(target=self.transcribe_and_type, daemon=True).start()
 
+    def _abort(self):
+        """Return to idle without typing anything."""
+        self.root.after(0, lambda: self._set_state("ready"))
+        self.root.after(0, self._schedule_idle_release)
+
     def transcribe_and_type(self):
+        try:
+            self._transcribe_and_type()
+        except Exception as e:
+            # _is_busy is only cleared by the "ready" state, and on_press bails
+            # while it is set, so an escaping exception would wedge the hotkey
+            # for the lifetime of the service.
+            print(f"Transcription failed: {e}")
+            self._abort()
+
+    def _transcribe_and_type(self):
         if not self.audio_buffer:
-            self.root.after(0, lambda: self._set_state("ready"))
+            self._abort()
             return
 
         audio_data = np.concatenate(self.audio_buffer).flatten()
-        if len(audio_data) < SAMPLE_RATE * 0.5:
-            self.root.after(0, lambda: self._set_state("ready"))
+        if len(audio_data) < SAMPLE_RATE * MIN_AUDIO_SEC:
+            self._abort()
+            return
+
+        if not self._model_ready.is_set():
+            self.root.after(0, lambda: self._set_state("loading"))
+            self._model_ready.wait()
+
+        with self._model_lock:
+            model = self.model
+        if model is None:
+            self._abort()
             return
 
         self.root.after(0, lambda: self._set_state("transcribing"))
 
-        segments, _ = self.model.transcribe(audio_data, beam_size=5)
+        segments, _ = model.transcribe(audio_data, beam_size=5)
 
         accumulated = ""
         for segment in segments:
@@ -275,9 +380,11 @@ class DictationApp:
     # ---------------------------------------------------------------- cleanup
 
     def on_close(self):
-        if hasattr(self, "stream"):
+        self._cancel_idle_release()
+        if self.stream is not None:
             self.stream.stop()
             self.stream.close()
+            self.stream = None
         if hasattr(self, "listener"):
             self.listener.stop()
         self.root.destroy()
