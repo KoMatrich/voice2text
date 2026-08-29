@@ -45,20 +45,25 @@
       # source. Which version that is follows nixpkgs and does change between
       # revs -- do not hard-code it.
       pythonEnv = pkgs.python3.withPackages (_: with pythonPackages; [
+        evdev
         faster-whisper
         numpy
-        pynput
         sounddevice
         tkinter
       ]);
 
       voice2text = pkgs.writeShellApplication {
         name = "voice2text";
+        # wl-copy puts the transcript on the clipboard; the app then sends a
+        # single paste chord through /dev/uinput.
+        runtimeInputs = [ pkgs.wl-clipboard ];
         text = ''
           # The CUDA libraries are linked against cuda_cudart's link-time
           # libcuda stub; the real one ships with the running NVIDIA driver.
           export LD_LIBRARY_PATH=/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-          exec ${pythonEnv}/bin/python ${./main.py} "$@"
+          # -u because stdout is a pipe to the journal, and Python would
+          # otherwise block-buffer every diagnostic into invisibility.
+          exec ${pythonEnv}/bin/python -u ${./main.py} "$@"
         '';
       };
     in

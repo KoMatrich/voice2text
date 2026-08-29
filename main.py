@@ -1,13 +1,29 @@
 import gc
+import select
+import subprocess
 import tkinter as tk
 import threading
+import time
+import evdev
 import sounddevice as sd
 import numpy as np
+from evdev import ecodes
 from faster_whisper import WhisperModel
-from pynput import keyboard
 
 # --- CONFIGURATION ---
-PUSH_TO_TALK_KEY = keyboard.Key.shift_r
+# Input and output both bypass X11 entirely. Under GNOME Wayland, mutter only
+# forwards keystrokes to XWayland while an X11 window has focus, so an XRecord
+# listener (what pynput uses) never sees the key in a native Wayland window --
+# which is nearly every window. Reading /dev/input is compositor-independent.
+PUSH_TO_TALK_CODE = ecodes.KEY_RIGHTSHIFT
+# The transcript goes onto the clipboard and is pasted with one chord, rather
+# than typed character by character: no keymap is involved, so diacritics
+# survive. Terminals want (KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V) instead.
+PASTE_CHORD = (ecodes.KEY_LEFTCTRL, ecodes.KEY_V)
+RESTORE_CLIPBOARD = False  # restoring races the paste; opt in if you want it
+# Our own virtual keyboard advertises every key code, so it would otherwise be
+# picked up by the listener's own device scan.
+UINPUT_NAME = "voice2text"
 MODEL_SIZE = "medium.en"  # Options: tiny, base, small, medium, large (and .en variants)
 SAMPLE_RATE = 16000
 MIN_AUDIO_SEC = 0.5
@@ -64,12 +80,17 @@ class DictationApp:
         # under this lock or via a local reference taken under it.
         self._model_lock = threading.Lock()
         self._model_ready = threading.Event()
-        self.keyboard_controller = keyboard.Controller()
+
+        # Created once and held: a freshly created uinput device takes a moment
+        # to be noticed by the compositor, so building one per paste would race
+        # the very keystroke we are trying to send.
+        self._uinput = evdev.UInput(name=UINPUT_NAME)
 
         # Nothing is acquired up front: no model, no audio stream. Only the
         # listener, so push-to-talk is live as soon as the imports finish.
         self._set_state("ready")
-        self.listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
+        self._listening = True
+        self.listener = threading.Thread(target=self._listen_loop, daemon=True)
         self.listener.start()
 
     # ------------------------------------------------------------------ UI build
@@ -96,7 +117,7 @@ class DictationApp:
         self.status_label.grid(row=0, column=1, sticky="ew")
 
         # Key hint label (right-aligned)
-        key_name = str(PUSH_TO_TALK_KEY).replace("Key.", "").upper()
+        key_name = ecodes.KEY[PUSH_TO_TALK_CODE].replace("KEY_", "")
         self.key_label = tk.Label(
             self.main_frame, text=f"[{key_name}]",
             font=("Helvetica", 9),
@@ -309,20 +330,120 @@ class DictationApp:
         if self.is_recording:
             self.audio_buffer.append(indata.copy())
 
-    def on_press(self, key):
-        if key == PUSH_TO_TALK_KEY and not self.key_pressed and not self._is_busy:
+    @staticmethod
+    def _open_keyboards():
+        """Every input device that can report the push-to-talk key.
+
+        Enumerated rather than hard-coded: there is a built-in keyboard and a
+        wireless receiver here, and the receiver comes and goes.
+        """
+        devices = []
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                continue  # not readable by us
+            is_ours = dev.name == UINPUT_NAME
+            if not is_ours and PUSH_TO_TALK_CODE in dev.capabilities().get(ecodes.EV_KEY, ()):
+                devices.append(dev)
+            else:
+                dev.close()
+        return devices
+
+    def _listen_loop(self):
+        while self._listening:
+            devices = self._open_keyboards()
+            if not devices:
+                print(
+                    "No readable keyboard devices. Is this user in the 'input' "
+                    "group, and has the session been restarted since it was added?"
+                )
+                time.sleep(5)
+                continue
+
+            print("Watching: " + ", ".join(f"{d.path} ({d.name})" for d in devices))
+            by_fd = {d.fd: d for d in devices}
+            try:
+                while self._listening:
+                    readable, _, _ = select.select(by_fd, [], [], 1.0)
+                    for fd in readable:
+                        for event in by_fd[fd].read():
+                            self._handle_key(event)
+            except OSError as e:
+                # A device vanished (receiver unplugged, suspend/resume).
+                # Re-enumerate rather than letting the hotkey die silently.
+                print(f"Input device went away ({e}); rescanning.")
+            finally:
+                for dev in devices:
+                    try:
+                        dev.close()
+                    except OSError:
+                        pass
+
+    def _handle_key(self, event):
+        if event.type != ecodes.EV_KEY or event.code != PUSH_TO_TALK_CODE:
+            return
+        if event.value == 1:
+            self.on_press()
+        elif event.value == 0:
+            self.on_release()
+        # value == 2 is autorepeat while held; ignore it or every repeat would
+        # restart the recording.
+
+    def on_press(self):
+        if not self.key_pressed and not self._is_busy:
             self.key_pressed = True
             self.audio_buffer = []
             self._acquire()
             self.is_recording = True
             self.root.after(0, lambda: self._set_state("recording"))
 
-    def on_release(self, key):
-        if key == PUSH_TO_TALK_KEY and self.key_pressed:
+    def on_release(self):
+        if self.key_pressed:
             self.key_pressed = False
             self.is_recording = False
             self._is_busy = True
             threading.Thread(target=self.transcribe_and_type, daemon=True).start()
+
+    # ---------------------------------------------------------------- output
+
+    def _paste(self, text):
+        """Put the text on the clipboard and send one paste chord.
+
+        Going through the clipboard means no character ever has to be mapped to
+        a scancode, so diacritics and any other non-layout character survive
+        intact. Only the chord itself is synthesised, and KEY_V sits in the same
+        physical position in cz+qwerty as it does in US layouts.
+        """
+        previous = None
+        if RESTORE_CLIPBOARD:
+            previous = subprocess.run(
+                ["wl-paste", "--no-newline"], capture_output=True
+            ).stdout
+
+        # wl-copy forks a daemon that owns the selection until it is replaced.
+        # That daemon inherits our stdout/stderr, so hand it /dev/null rather
+        # than leaving it holding the journal pipe open for its whole life.
+        subprocess.run(
+            ["wl-copy"], input=text.encode(), check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        for code in PASTE_CHORD:
+            self._uinput.write(ecodes.EV_KEY, code, 1)
+        self._uinput.syn()
+        for code in reversed(PASTE_CHORD):
+            self._uinput.write(ecodes.EV_KEY, code, 0)
+        self._uinput.syn()
+
+        if previous is not None:
+            # The paste is asynchronous; overwrite the clipboard too soon and
+            # the target window reads back the old contents.
+            time.sleep(0.5)
+            subprocess.run(
+                ["wl-copy"], input=previous, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
 
     def _abort(self):
         """Return to idle without typing anything."""
@@ -372,8 +493,8 @@ class DictationApp:
         final_text = accumulated.strip()
 
         if final_text:
-            self.keyboard_controller.type(final_text + " ")
-            print(f"Typed: {final_text}")
+            self._paste(final_text + " ")
+            print(f"Pasted: {final_text}")
 
         self.root.after(0, lambda t=final_text: self._set_state("done", t))
 
@@ -381,12 +502,14 @@ class DictationApp:
 
     def on_close(self):
         self._cancel_idle_release()
+        self._listening = False  # the listen loop is a daemon; let it unwind
         if self.stream is not None:
             self.stream.stop()
             self.stream.close()
             self.stream = None
-        if hasattr(self, "listener"):
-            self.listener.stop()
+        if self._uinput is not None:
+            self._uinput.close()
+            self._uinput = None
         self.root.destroy()
 
 

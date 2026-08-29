@@ -23,14 +23,14 @@ collects it and the next launch spends ~6 min re-fetching 900 MB.
 Single file (`main.py`), one `DictationApp`. Nothing is acquired until it is
 needed:
 
-- **Idle** — only the hidden Tk window and the `pynput` listener exist. No
-  model, no microphone.
+- **Idle** — only the hidden Tk window, the evdev listener thread and the
+  uinput device exist. No model, no microphone.
 - **Key press** — `_acquire()` opens the audio stream (~25 ms) and kicks off
   `_ensure_model()` on a background thread, so the ~1.8 s model load overlaps
   with the user speaking rather than following it.
 - **Key release** — a daemon thread waits on `_model_ready`, transcribes with
-  streaming segments, and types via `pynput.keyboard.Controller`. Clips shorter
-  than `MIN_AUDIO_SEC` are dropped.
+  streaming segments, and hands the text to `_paste()`. Clips shorter than
+  `MIN_AUDIO_SEC` are dropped.
 - **After `IDLE_RELEASE_SEC`** — `_release_resources()` drops the model and
   closes the stream, returning ~1.9 GB of VRAM and clearing GNOME's
   "microphone in use" indicator.
@@ -46,11 +46,38 @@ take a local reference. `_is_busy` serialises transcriptions. `_ensure_model`
 always sets `_model_ready`, even on failure, or a waiter would hang forever
 with `_is_busy` stuck true.
 
+## Input and output both bypass X11
+
+This is the single most important thing to understand before changing either
+end, and the reason `pynput` is *not* a dependency.
+
+Under GNOME Wayland, mutter forwards keystrokes to XWayland only while an X11
+window has focus. On this machine `xlsclients` lists five X11 clients — Discord,
+Steam, steamwebhelper, ibus-x11, mutter-x11-frames — and nothing else. So an
+XRecord listener (what `pynput` uses) sees the push-to-talk key essentially
+never. `pynput`'s own `uinput` backend is not an escape hatch either: it builds
+its layout table at *import* time by running `dumpkeys`, which fails for a
+non-root user.
+
+- **In** — one thread `select()`s over every `/dev/input/event*` device whose
+  capabilities include `PUSH_TO_TALK_CODE`, enumerated at startup rather than
+  hard-coded (there is a built-in keyboard *and* a wireless receiver, and the
+  receiver comes and goes). Requires the user in the `input` group. `value == 2`
+  is autorepeat and must be ignored, or holding the key restarts the recording
+  continuously.
+- **Out** — `wl-copy` puts the transcript on the clipboard and a single Ctrl+V
+  is emitted through `/dev/uinput`. Nothing is ever typed character by
+  character, so no keymap is involved and diacritics survive exactly. The
+  uinput device is created once at startup: a fresh one takes a moment for the
+  compositor to notice, so building one per paste would race the keystroke.
+
 ## Configuration (top of `main.py`)
 
 | Constant | Default | Purpose |
 |---|---|---|
-| `PUSH_TO_TALK_KEY` | `keyboard.Key.shift_r` | Trigger key |
+| `PUSH_TO_TALK_CODE` | `ecodes.KEY_RIGHTSHIFT` | Trigger key (evdev code) |
+| `PASTE_CHORD` | `(KEY_LEFTCTRL, KEY_V)` | Add `KEY_LEFTSHIFT` for terminals |
+| `RESTORE_CLIPBOARD` | `False` | Restoring races the paste; opt in |
 | `MODEL_SIZE` | `"medium.en"` | Whisper model variant |
 | `SAMPLE_RATE` | `16000` | Audio sample rate (Hz) |
 | `MIN_AUDIO_SEC` | `0.5` | Shorter clips are discarded |
@@ -60,10 +87,14 @@ with `_is_busy` stuck true.
 
 - **4 GB VRAM** (GTX 1650). `medium.en` at fp16 needs ~1.9 GB, so holding it
   while idle is most of the card. Don't reintroduce an eager load.
-- **`pynput` runs its X11 backend** (`pynput.keyboard._xorg`) under XWayland,
-  so the hotkey only fires while an X11/XWayland window has focus. Typing via
-  XTEST works everywhere. Going compositor-independent means switching the
-  listener to `evdev`, which needs the user in the `input` group.
+- **The `input` group only takes effect after a session restart.** Supplementary
+  groups are fixed when `user@1000.service` starts, so `nh os switch` alone
+  leaves `voice2text.service` with the old group set and no readable input
+  devices. Log out and back in, or reboot. `id | grep input` is the check.
+- **Run Python with `-u`.** stdout is a pipe to the journal, so without it every
+  diagnostic is block-buffered into invisibility — which is exactly why an
+  earlier debugging session found a completely empty journal for a service that
+  was failing.
 - **CUDA CTranslate2 is built from source** and is in no binary cache. It is
   pinned to `sm_75` via `CUDA_ARCH_LIST` (CTranslate2 uses CMake's legacy
   FindCUDA path and ignores `CMAKE_CUDA_ARCHITECTURES`; the default `Auto`
