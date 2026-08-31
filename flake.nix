@@ -80,7 +80,10 @@
       };
 
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ pythonEnv ];
+        # wl-clipboard as well as the interpreter: the packaged app gets
+        # wl-copy from runtimeInputs, and without it here `python main.py`
+        # transcribes fine and then dies on the paste.
+        packages = [ pythonEnv pkgs.wl-clipboard ];
         LD_LIBRARY_PATH = "/run/opengl-driver/lib";
         shellHook = ''
           echo "voice2text dev shell: $(python3 --version 2>&1). Run: python main.py"

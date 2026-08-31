@@ -26,19 +26,25 @@ needed:
 - **Idle** — only the hidden Tk window, the evdev listener thread and the
   uinput device exist. No model, no microphone.
 - **Key press** — `_acquire()` opens the audio stream (~25 ms) and kicks off
-  `_ensure_model()` on a background thread, so the ~1.8 s model load overlaps
+  `_ensure_model()` on a background thread, so the ~1.7 s model load overlaps
   with the user speaking rather than following it.
 - **Key release** — a daemon thread waits on `_model_ready`, transcribes with
   streaming segments, and hands the text to `_paste()`. Clips shorter than
-  `MIN_AUDIO_SEC` are dropped.
+  `MIN_AUDIO_SEC` are dropped and the overlay flashes "Canceled" instead.
 - **After `IDLE_RELEASE_SEC`** — `_release_resources()` drops the model and
-  closes the stream, returning ~1.9 GB of VRAM and clearing GNOME's
+  closes the stream, returning ~2.1 GB of VRAM and clearing GNOME's
   "microphone in use" indicator.
 
 `_set_state(state, text)` is the only path to a visual change:
-`ready → recording → (loading) → transcribing → done → ready`. Presses, audio
-callbacks and transcription all run off the main thread, so **every** Tk call
-from them goes through `root.after(0, ...)` — including `after_cancel`.
+`ready → recording → (loading) → transcribing → done → ready`, with `canceled`
+(nothing to type: too short, or no speech) and `error` (something broke) as the
+other two exits. Both are visible states on purpose -- returning straight to
+`ready` made an unloadable model look identical to a recording that never
+started. In `recording` the status line is an elapsed clock rather than a word.
+Presses, audio callbacks and transcription all run off the main thread, so
+**every** Tk call from them goes through `root.after(0, ...)` — including
+`after_cancel`. The recording clock and the pulse are two separate `after`
+chains, so every state entry stops both.
 
 `self.model` is written by the loader thread, read by the transcription thread
 and cleared from the Tk thread; all three go through `_model_lock`, and readers
@@ -78,15 +84,23 @@ non-root user.
 | `PUSH_TO_TALK_CODE` | `ecodes.KEY_RIGHTSHIFT` | Trigger key (evdev code) |
 | `PASTE_CHORD` | `(KEY_LEFTCTRL, KEY_V)` | Add `KEY_LEFTSHIFT` for terminals |
 | `RESTORE_CLIPBOARD` | `False` | Restoring races the paste; opt in |
-| `MODEL_SIZE` | `"medium.en"` | Whisper model variant |
+| `MODEL_SIZE` | `"large-v3-turbo"` | Whisper model variant |
 | `SAMPLE_RATE` | `16000` | Audio sample rate (Hz) |
-| `MIN_AUDIO_SEC` | `0.5` | Shorter clips are discarded |
+| `MIN_AUDIO_SEC` | `0.25` | Shorter clips are discarded |
+| `CANCEL_FLASH_MS` | `500` | How long "Canceled" stays up |
+| `ERROR_FLASH_MS` | `3000` | How long "Error" stays up |
+| `TIMER_TICK_MS` | `100` | Recording-clock refresh |
 | `IDLE_RELEASE_SEC` | `90` | Idle time before freeing model + mic |
 
 ## Constraints
 
-- **4 GB VRAM** (GTX 1650). `medium.en` at fp16 needs ~1.9 GB, so holding it
-  while idle is most of the card. Don't reintroduce an eager load.
+- **4 GB VRAM** (GTX 1650). `large-v3-turbo` at fp16 sits at ~2.1 GB resident,
+  so holding it while idle is most of the card. Don't reintroduce an eager load.
+- **`MODEL_SIZE` must be a name faster-whisper knows.** An unknown one (an
+  invented `medium.large`, say) fails the GPU load *and* the CPU fallback, and
+  before the `error` state existed the only symptom was the overlay vanishing
+  on key release with nothing pasted. Valid: `tiny`/`base`/`small`/`medium`
+  (+`.en`), `large-v1`/`v2`/`v3`, `large-v3-turbo`, `turbo`, `distil-*`.
 - **The `input` group only takes effect after a session restart.** Supplementary
   groups are fixed when `user@1000.service` starts, so `nh os switch` alone
   leaves `voice2text.service` with the old group set and no readable input

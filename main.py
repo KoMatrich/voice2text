@@ -24,11 +24,26 @@ RESTORE_CLIPBOARD = False  # restoring races the paste; opt in if you want it
 # Our own virtual keyboard advertises every key code, so it would otherwise be
 # picked up by the listener's own device scan.
 UINPUT_NAME = "voice2text"
-MODEL_SIZE = "medium.large"  # Options: tiny, base, small, medium, large (and .en variants)
+# Must be one of faster-whisper's known names. An unknown one fails *both* the
+# GPU and the CPU load, and the only visible symptom is the window disappearing
+# on release with nothing pasted.
+MODEL_SIZE = "large-v3-turbo"  # tiny/base/small/medium/large-v3/large-v3-turbo (+ .en variants)
+# Unlike the .en models, large-v3-turbo is multilingual and auto-detects the
+# language of every clip. Over a few seconds of dictation that detection is
+# close to a coin flip -- English speech comes back transliterated into Cyrillic
+# often enough to be useless -- so pin it. Pinning also skips the detection
+# pass. None restores auto-detection; "cs" dictates Czech.
+LANGUAGE = "en"
 SAMPLE_RATE = 16000
-MIN_AUDIO_SEC = 0.75
-# How long to stay idle before dropping the model (~1.9 GB of VRAM on this 4 GB
-# card) and closing the microphone. Reacquiring both costs ~1.8 s, and that is
+MIN_AUDIO_SEC = 1.5
+# How long the "Canceled" / "Error" notices linger before the window hides.
+CANCEL_FLASH_MS = 500
+ERROR_FLASH_MS = 3000
+# Recording clock refresh. 100 ms reads as a smooth tenths-of-a-second counter
+# without giving the Tk thread anything to do between frames.
+TIMER_TICK_MS = 100
+# How long to stay idle before dropping the model (~2.1 GB of VRAM on this 4 GB
+# card) and closing the microphone. Reacquiring both costs ~1.7 s, and that is
 # hidden under the next recording because the load starts on key press.
 IDLE_RELEASE_SEC = 90
 
@@ -74,12 +89,15 @@ class DictationApp:
         self._pulse_job = None
         self._hide_job = None
         self._idle_job = None
+        self._timer_job = None
+        self._record_started = None
         self._is_busy = False
         # self.model is written by the loader thread, read by the transcription
         # thread and cleared from the Tk thread, so every touch of it is either
         # under this lock or via a local reference taken under it.
         self._model_lock = threading.Lock()
         self._model_ready = threading.Event()
+        self._model_error = None
 
         # Created once and held: a freshly created uinput device takes a moment
         # to be noticed by the compositor, so building one per paste would race
@@ -201,11 +219,33 @@ class DictationApp:
             self.root.after_cancel(self._pulse_job)
             self._pulse_job = None
 
+    # ---------------------------------------------------------------- recording clock
+
+    def _start_timer(self):
+        self._record_started = time.monotonic()
+        self._tick_timer()
+
+    def _tick_timer(self):
+        if self._record_started is None:
+            return
+        elapsed = time.monotonic() - self._record_started
+        self.status_label.config(
+            text=f"{int(elapsed // 60)}:{elapsed % 60:04.1f}", fg=ACCENT_REC
+        )
+        self._timer_job = self.root.after(TIMER_TICK_MS, self._tick_timer)
+
+    def _stop_timer(self):
+        self._record_started = None
+        if self._timer_job:
+            self.root.after_cancel(self._timer_job)
+            self._timer_job = None
+
     # ---------------------------------------------------------------- state machine
 
     def _set_state(self, state: str, text: str = ""):
         if state == "ready":
             self._stop_pulse()
+            self._stop_timer()
             self.dot_canvas.itemconfig(self.dot_item, fill=ACCENT_IDLE)
             self._hide_window()
             self._is_busy = False
@@ -215,19 +255,23 @@ class DictationApp:
                 self.root.after_cancel(self._hide_job)
                 self._hide_job = None
             self.text_label.config(text="")
-            self.status_label.config(text="Recording", fg=ACCENT_REC)
+            # The elapsed clock replaces the word "Recording": it is the one
+            # thing the pulsing dot cannot tell you.
+            self._start_timer()
             self._start_pulse(ACCENT_REC, "#7a0000", 400)
             self._show_window()
 
         elif state == "loading":
             # Only reached when the key was released before the model finished
             # loading; otherwise the load is fully hidden by the recording.
+            self._stop_timer()
             self.status_label.config(text="Loading model...", fg=ACCENT_PROC)
             self.text_label.config(text="")
             self._start_pulse(ACCENT_PROC, "#7a6500", 700)
             self._show_window()
 
         elif state == "transcribing":
+            self._stop_timer()
             self.status_label.config(text="Transcribing...", fg=ACCENT_PROC)
             self._start_pulse(ACCENT_PROC, "#7a6500", 700)
             if text:
@@ -235,10 +279,43 @@ class DictationApp:
 
         elif state == "done":
             self._stop_pulse()
+            self._stop_timer()
             self.dot_canvas.itemconfig(self.dot_item, fill=ACCENT_IDLE)
             self.status_label.config(text="Done", fg=ACCENT_IDLE)
             self.text_label.config(text=text if text else "")
             self._hide_job = self.root.after(1400, lambda: self._set_state("ready"))
+            self._schedule_idle_release()
+
+        elif state == "canceled":
+            # Nothing was typed, and that is expected: a blip of a press, or
+            # silence. Say so briefly rather than just vanishing.
+            self._stop_pulse()
+            self._stop_timer()
+            self.dot_canvas.itemconfig(self.dot_item, fill=ACCENT_REC)
+            self.status_label.config(text="Canceled", fg=ACCENT_REC)
+            self.text_label.config(text=text if text else "")
+            # Cleared here rather than at "ready": the flash is short enough
+            # that pressing the hotkey again during it must still record.
+            self._is_busy = False
+            self._show_window()
+            self._hide_job = self.root.after(
+                CANCEL_FLASH_MS, lambda: self._set_state("ready")
+            )
+            self._schedule_idle_release()
+
+        elif state == "error":
+            # Nothing was typed and that is *not* expected. Held longer, with
+            # the reason in the subtext. A silent exit here is exactly what
+            # made an invalid MODEL_SIZE look like a recording bug.
+            self._stop_pulse()
+            self._stop_timer()
+            self.dot_canvas.itemconfig(self.dot_item, fill=ACCENT_REC)
+            self.status_label.config(text="Error", fg=ACCENT_REC)
+            self.text_label.config(text=text if text else "")
+            self._show_window()
+            self._hide_job = self.root.after(
+                ERROR_FLASH_MS, lambda: self._set_state("ready")
+            )
             self._schedule_idle_release()
 
     # ---------------------------------------------------------------- acquire / release
@@ -267,6 +344,7 @@ class DictationApp:
         with self._model_lock:
             try:
                 if self.model is None:
+                    self._model_error = None
                     try:
                         print("Attempting to load model on GPU...")
                         self.model = self._new_model("cuda", "float16")
@@ -277,6 +355,8 @@ class DictationApp:
                         print("CPU loaded successfully.")
             except Exception as e:
                 print(f"Model load failed: {e}")
+                # Kept so the failure reaches the overlay, not just the journal.
+                self._model_error = str(e)
             finally:
                 # Always signal, including on failure: transcribe_and_type
                 # waits on this and would otherwise hang with _is_busy stuck.
@@ -445,9 +525,9 @@ class DictationApp:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
 
-    def _abort(self):
-        """Return to idle without typing anything."""
-        self.root.after(0, lambda: self._set_state("ready"))
+    def _abort(self, state="canceled", text=""):
+        """Return to idle without typing anything, saying why."""
+        self.root.after(0, lambda: self._set_state(state, text))
         self.root.after(0, self._schedule_idle_release)
 
     def transcribe_and_type(self):
@@ -458,16 +538,17 @@ class DictationApp:
             # while it is set, so an escaping exception would wedge the hotkey
             # for the lifetime of the service.
             print(f"Transcription failed: {e}")
-            self._abort()
+            self._abort("error", str(e))
 
     def _transcribe_and_type(self):
         if not self.audio_buffer:
-            self._abort()
+            self._abort("canceled", "no audio captured")
             return
 
         audio_data = np.concatenate(self.audio_buffer).flatten()
-        if len(audio_data) < SAMPLE_RATE * MIN_AUDIO_SEC:
-            self._abort()
+        duration = len(audio_data) / SAMPLE_RATE
+        if duration < MIN_AUDIO_SEC:
+            self._abort("canceled", f"{duration:.1f}s < {MIN_AUDIO_SEC}s minimum")
             return
 
         if not self._model_ready.is_set():
@@ -477,12 +558,19 @@ class DictationApp:
         with self._model_lock:
             model = self.model
         if model is None:
-            self._abort()
+            self._abort("error", self._model_error or f"no model '{MODEL_SIZE}'")
             return
 
         self.root.after(0, lambda: self._set_state("transcribing"))
 
-        segments, _ = model.transcribe(audio_data, beam_size=5)
+        # vad_filter drops non-speech before decoding. Without it a clip that is
+        # mostly room tone makes the model emit its training filler ("Thank
+        # you.", "Продолжение следует...") with high confidence, and that gets
+        # pasted. With it, such a clip yields no segments and lands in
+        # "canceled" instead.
+        segments, _ = model.transcribe(
+            audio_data, beam_size=5, language=LANGUAGE, vad_filter=True,
+        )
 
         accumulated = ""
         for segment in segments:
@@ -492,9 +580,12 @@ class DictationApp:
 
         final_text = accumulated.strip()
 
-        if final_text:
-            self._paste(final_text + " ")
-            print(f"Pasted: {final_text}")
+        if not final_text:
+            self._abort("canceled", "no speech detected")
+            return
+
+        self._paste(final_text + " ")
+        print(f"Pasted: {final_text}")
 
         self.root.after(0, lambda t=final_text: self._set_state("done", t))
 
