@@ -29,8 +29,9 @@ needed:
   `_ensure_model()` on a background thread, so the ~1.7 s model load overlaps
   with the user speaking rather than following it.
 - **Key release** — a daemon thread waits on `_model_ready`, transcribes with
-  streaming segments, and hands the text to `_paste()`. Clips shorter than
-  `MIN_AUDIO_SEC` are dropped and the overlay flashes "Canceled" instead.
+  streaming segments, and hands the text to `_paste()`, which copies it to the
+  clipboard (and, only if `AUTO_PASTE` is on, also types it). Clips shorter
+  than `MIN_AUDIO_SEC` are dropped and the overlay flashes "Canceled" instead.
 - **After `IDLE_RELEASE_SEC`** — `_release_resources()` drops the model and
   closes the stream, returning ~2.1 GB of VRAM and clearing GNOME's
   "microphone in use" indicator.
@@ -71,9 +72,13 @@ non-root user.
   receiver comes and goes). Requires the user in the `input` group. `value == 2`
   is autorepeat and must be ignored, or holding the key restarts the recording
   continuously.
-- **Out** — `wl-copy` puts the transcript on the clipboard and a single Ctrl+V
-  is emitted through `/dev/uinput`. Nothing is ever typed character by
-  character, so no keymap is involved and diacritics survive exactly. The
+- **Out** — `wl-copy` puts the transcript on the clipboard; that's the whole
+  path by default. The transcript is never typed automatically, because a
+  synthesized keystroke lands in whatever window has focus by the time
+  transcription finishes, not necessarily the one the user meant. Setting
+  `AUTO_PASTE = True` also emits a single Ctrl+V through `/dev/uinput` right
+  after the copy. Nothing is ever typed character by character, so no keymap
+  is involved and diacritics survive exactly. When `AUTO_PASTE` is on, the
   uinput device is created once at startup: a fresh one takes a moment for the
   compositor to notice, so building one per paste would race the keystroke.
 
@@ -84,6 +89,7 @@ non-root user.
 | `PUSH_TO_TALK_CODE` | `ecodes.KEY_RIGHTSHIFT` | Trigger key (evdev code) |
 | `PASTE_CHORD` | `(KEY_LEFTCTRL, KEY_V)` | Add `KEY_LEFTSHIFT` for terminals |
 | `RESTORE_CLIPBOARD` | `False` | Restoring races the paste; opt in |
+| `AUTO_PASTE` | `False` | Also synthesize the paste chord after copying; off by default so the transcript never lands in the wrong focused window |
 | `MODEL_SIZE` | `"large-v3-turbo"` | Whisper model variant |
 | `SAMPLE_RATE` | `16000` | Audio sample rate (Hz) |
 | `MIN_AUDIO_SEC` | `0.25` | Shorter clips are discarded |

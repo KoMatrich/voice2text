@@ -21,6 +21,11 @@ PUSH_TO_TALK_CODE = ecodes.KEY_RIGHTSHIFT
 # survive. Terminals want (KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V) instead.
 PASTE_CHORD = (ecodes.KEY_LEFTCTRL, ecodes.KEY_V)
 RESTORE_CLIPBOARD = False  # restoring races the paste; opt in if you want it
+# Off by default: synthesizing the paste risks it landing in whatever window
+# has focus by the time transcription finishes, not the one the user meant.
+# With this off, the transcript only ever reaches the clipboard -- the user
+# pastes it themselves once they're looking at the right window.
+AUTO_PASTE = False
 # Our own virtual keyboard advertises every key code, so it would otherwise be
 # picked up by the listener's own device scan.
 UINPUT_NAME = "voice2text"
@@ -45,7 +50,7 @@ TIMER_TICK_MS = 100
 # How long to stay idle before dropping the model (~2.1 GB of VRAM on this 4 GB
 # card) and closing the microphone. Reacquiring both costs ~1.7 s, and that is
 # hidden under the next recording because the load starts on key press.
-IDLE_RELEASE_SEC = 90
+IDLE_RELEASE_SEC = 10
 
 # --- THEME ---
 BG_COLOR      = "#1c1c1e"
@@ -101,8 +106,9 @@ class DictationApp:
 
         # Created once and held: a freshly created uinput device takes a moment
         # to be noticed by the compositor, so building one per paste would race
-        # the very keystroke we are trying to send.
-        self._uinput = evdev.UInput(name=UINPUT_NAME)
+        # the very keystroke we are trying to send. Only needed when AUTO_PASTE
+        # is on -- otherwise nothing ever writes to it.
+        self._uinput = evdev.UInput(name=UINPUT_NAME) if AUTO_PASTE else None
 
         # Nothing is acquired up front: no model, no audio stream. Only the
         # listener, so push-to-talk is live as soon as the imports finish.
@@ -281,7 +287,8 @@ class DictationApp:
             self._stop_pulse()
             self._stop_timer()
             self.dot_canvas.itemconfig(self.dot_item, fill=ACCENT_IDLE)
-            self.status_label.config(text="Done", fg=ACCENT_IDLE)
+            done_label = "Pasted" if AUTO_PASTE else "Copied"
+            self.status_label.config(text=done_label, fg=ACCENT_IDLE)
             self.text_label.config(text=text if text else "")
             self._hide_job = self.root.after(1400, lambda: self._set_state("ready"))
             self._schedule_idle_release()
@@ -488,15 +495,16 @@ class DictationApp:
     # ---------------------------------------------------------------- output
 
     def _paste(self, text):
-        """Put the text on the clipboard and send one paste chord.
+        """Put the text on the clipboard, and send the paste chord if AUTO_PASTE.
 
         Going through the clipboard means no character ever has to be mapped to
         a scancode, so diacritics and any other non-layout character survive
-        intact. Only the chord itself is synthesised, and KEY_V sits in the same
-        physical position in cz+qwerty as it does in US layouts.
+        intact. When AUTO_PASTE is on, only the chord itself is synthesised,
+        and KEY_V sits in the same physical position in cz+qwerty as it does in
+        US layouts.
         """
         previous = None
-        if RESTORE_CLIPBOARD:
+        if AUTO_PASTE and RESTORE_CLIPBOARD:
             previous = subprocess.run(
                 ["wl-paste", "--no-newline"], capture_output=True
             ).stdout
@@ -508,6 +516,9 @@ class DictationApp:
             ["wl-copy"], input=text.encode(), check=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+
+        if not AUTO_PASTE:
+            return
 
         for code in PASTE_CHORD:
             self._uinput.write(ecodes.EV_KEY, code, 1)
@@ -585,7 +596,7 @@ class DictationApp:
             return
 
         self._paste(final_text + " ")
-        print(f"Pasted: {final_text}")
+        print(f"{'Pasted' if AUTO_PASTE else 'Copied'}: {final_text}")
 
         self.root.after(0, lambda t=final_text: self._set_state("done", t))
 
