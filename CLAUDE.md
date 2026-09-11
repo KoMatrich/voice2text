@@ -1,57 +1,91 @@
 # CLAUDE.md
 
 Push-to-talk Whisper dictation for NixOS. Hold right Shift, speak, release —
-the transcript is typed into the focused window.
+the transcript lands on the clipboard (and, with `AUTO_PASTE`, is pasted into
+the focused window).
 
 ## Running
 
 ```bash
 nix run .            # the packaged app
-nix develop          # then: python main.py, for hacking on main.py
+nix develop          # then: python main.py, for hacking on the package
+python -m unittest discover -s tests    # in the dev shell
 ```
 
 The flake builds a self-contained Python env — no `uv`, no `.venv`. On boot the
 app runs as a systemd user service via `homeModules.default`, imported from
 `/etc/nixos/home.nix` (`services.voice2text.enable = true`). Because that input
-is `git+file://`, `main.py` must be committed before `nh os switch` picks it up.
+is `git+file://`, changes must be committed before `nh os switch` picks them
+up, and a new file must at least be `git add`ed before even a local
+`nix build` can see it. Only `main.py` and `voice2text/` go into the package's
+store path, so edits to anything else don't restart the service.
 
 Installing the package is also what GC-roots cuDNN. Without it, `nh clean`
 collects it and the next launch spends ~6 min re-fetching 900 MB.
 
 ## Architecture
 
-Single file (`main.py`), one `DictationApp`. Nothing is acquired until it is
-needed:
+`main.py` is only a launcher; the code is the `voice2text/` package:
 
-- **Idle** — only the hidden Tk window, the evdev listener thread and the
-  uinput device exist. No model, no microphone.
-- **Key press** — `_acquire()` opens the audio stream (~25 ms) and kicks off
-  `_ensure_model()` on a background thread, so the ~1.7 s model load overlaps
-  with the user speaking rather than following it.
-- **Key release** — a daemon thread waits on `_model_ready`, transcribes with
-  streaming segments, and hands the text to `_paste()`, which copies it to the
-  clipboard (and, only if `AUTO_PASTE` is on, also types it). Clips shorter
-  than `MIN_AUDIO_SEC` are dropped and the overlay flashes "Canceled" instead.
+| Module | Job |
+|---|---|
+| `config.py` | Every tunable constant |
+| `gesture.py` | `PushToTalk`: raw key events → start / stop / cancel. Pure, unit-tested |
+| `keyboard.py` | evdev device scan, and the listener thread that drives the gesture |
+| `audio.py` | `Recorder`: the microphone stream and the captured chunks |
+| `model.py` | `ModelLoader`: background load, wait, release |
+| `output.py` | `wl-copy`, plus the optional uinput paste chord |
+| `overlay.py` | The Tk status window — visuals only |
+| `app.py` | `DictationApp`, which wires the rest together |
+
+Nothing is acquired until it is needed:
+
+- **Idle** — only the hidden Tk window and the evdev listener thread exist
+  (plus the uinput device, if `AUTO_PASTE`). No model, no microphone.
+- **Key down** — still nothing. The key must be held on its own for
+  `ARM_DELAY_MS`. Any other key pressed inside that window means right Shift is
+  being used as Shift — a capital letter, a shortcut — and the press is dropped
+  silently: no overlay, no microphone, no model. Without this, every capital
+  typed with right Shift loaded 2.1 GB into VRAM (and once ran the card out of
+  memory). Releases of other keys don't count, so the tail of the previous word
+  doesn't spoil a press.
+- **Armed** — the stream opens (~25 ms), recording starts, the overlay appears
+  and `ModelLoader.preload()` begins the ~1.7 s load on a background thread, so
+  it overlaps with the user speaking rather than following it. Speech before
+  the overlay appears is not captured; its appearance is the cue to talk.
+- **Another key while recording** — cancels, with a "Canceled" flash. Further
+  keys are ignored until the release.
+- **Key up** — a daemon thread waits for the model, transcribes with streaming
+  segments, and hands the text to `Output.deliver()`. Clips shorter than
+  `MIN_AUDIO_SEC` flash "Canceled" instead.
 - **After `IDLE_RELEASE_SEC`** — `_release_resources()` drops the model and
   closes the stream, returning ~2.1 GB of VRAM and clearing GNOME's
-  "microphone in use" indicator.
+  "microphone in use" indicator. Mid-load it reschedules itself rather than
+  block the Tk thread.
 
-`_set_state(state, text)` is the only path to a visual change:
+`Overlay.show(state, text)` is the only path to a visual change:
 `ready → recording → (loading) → transcribing → done → ready`, with `canceled`
-(nothing to type: too short, or no speech) and `error` (something broke) as the
-other two exits. Both are visible states on purpose -- returning straight to
-`ready` made an unloadable model look identical to a recording that never
-started. In `recording` the status line is an elapsed clock rather than a word.
-Presses, audio callbacks and transcription all run off the main thread, so
-**every** Tk call from them goes through `root.after(0, ...)` — including
-`after_cancel`. The recording clock and the pulse are two separate `after`
-chains, so every state entry stops both.
+(nothing to type: too short, no speech, interrupted) and `error` (something
+broke) as the other two exits. Both are visible states on purpose -- returning
+straight to `ready` made an unloadable model look identical to a recording that
+never started. In `recording` the status line is an elapsed clock rather than a
+word. The pulse, the clock and the auto-hide are three separate `after` chains,
+and every `show()` stops all three.
 
-`self.model` is written by the loader thread, read by the transcription thread
-and cleared from the Tk thread; all three go through `_model_lock`, and readers
-take a local reference. `_is_busy` serialises transcriptions. `_ensure_model`
-always sets `_model_ready`, even on failure, or a waiter would hang forever
-with `_is_busy` stuck true.
+### Threads
+
+- The **listener thread** owns the `PushToTalk` gesture outright. The arm
+  delay is just its `select()` timeout, so there is no timer thread and no lock.
+- **All `DictationApp` state lives on the Tk thread.** Gesture callbacks and
+  the transcription thread reach it only through `_post()`
+  (`root.after(0, ...)`); never call Tk, or a `DictationApp` method, directly
+  from another thread. That is why `_recording`, `_busy` and the idle job need
+  no locks. `_busy` serialises transcriptions and is cleared on entering a
+  terminal state, so a new recording can start while "Copied" is still up.
+- `Recorder` locks its chunk list against the PortAudio callback thread.
+- `ModelLoader` loads outside its lock. `_idle` is set whenever no load is in
+  flight, even after a failure, or a waiting transcription would hang forever
+  with `_busy` stuck true.
 
 ## Input and output both bypass X11
 
@@ -67,11 +101,12 @@ its layout table at *import* time by running `dumpkeys`, which fails for a
 non-root user.
 
 - **In** — one thread `select()`s over every `/dev/input/event*` device whose
-  capabilities include `PUSH_TO_TALK_CODE`, enumerated at startup rather than
+  capabilities include `PUSH_TO_TALK_CODE`, enumerated on each scan rather than
   hard-coded (there is a built-in keyboard *and* a wireless receiver, and the
   receiver comes and goes). Requires the user in the `input` group. `value == 2`
   is autorepeat and must be ignored, or holding the key restarts the recording
-  continuously.
+  continuously. Only keyboards are watched, so a Shift+click with the mouse is
+  not seen as "another key".
 - **Out** — `wl-copy` puts the transcript on the clipboard; that's the whole
   path by default. The transcript is never typed automatically, because a
   synthesized keystroke lands in whatever window has focus by the time
@@ -82,21 +117,24 @@ non-root user.
   uinput device is created once at startup: a fresh one takes a moment for the
   compositor to notice, so building one per paste would race the keystroke.
 
-## Configuration (top of `main.py`)
+## Configuration (`voice2text/config.py`)
 
 | Constant | Default | Purpose |
 |---|---|---|
 | `PUSH_TO_TALK_CODE` | `ecodes.KEY_RIGHTSHIFT` | Trigger key (evdev code) |
+| `ARM_DELAY_MS` | `300` | Hold time before recording starts; another key inside it means typing, and the press is ignored |
 | `PASTE_CHORD` | `(KEY_LEFTCTRL, KEY_V)` | Add `KEY_LEFTSHIFT` for terminals |
 | `RESTORE_CLIPBOARD` | `False` | Restoring races the paste; opt in |
 | `AUTO_PASTE` | `False` | Also synthesize the paste chord after copying; off by default so the transcript never lands in the wrong focused window |
 | `MODEL_SIZE` | `"large-v3-turbo"` | Whisper model variant |
+| `LANGUAGE` | `"en"` | Pinned: auto-detection is a coin flip on short clips. `None` re-enables it |
 | `SAMPLE_RATE` | `16000` | Audio sample rate (Hz) |
-| `MIN_AUDIO_SEC` | `0.25` | Shorter clips are discarded |
+| `MIN_AUDIO_SEC` | `1.5` | Shorter clips are discarded |
+| `DONE_FLASH_MS` | `1400` | How long "Copied"/"Pasted" stays up |
 | `CANCEL_FLASH_MS` | `500` | How long "Canceled" stays up |
 | `ERROR_FLASH_MS` | `3000` | How long "Error" stays up |
 | `TIMER_TICK_MS` | `100` | Recording-clock refresh |
-| `IDLE_RELEASE_SEC` | `90` | Idle time before freeing model + mic |
+| `IDLE_RELEASE_SEC` | `10` | Idle time before freeing model + mic |
 
 ## Constraints
 

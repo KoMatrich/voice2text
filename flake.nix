@@ -52,6 +52,13 @@
         tkinter
       ]);
 
+      # Just the launcher and the package, so editing flake.nix, CLAUDE.md or
+      # the tests leaves the store path -- and the running service -- alone.
+      src = pkgs.lib.fileset.toSource {
+        root = ./.;
+        fileset = pkgs.lib.fileset.unions [ ./main.py ./voice2text ];
+      };
+
       voice2text = pkgs.writeShellApplication {
         name = "voice2text";
         # wl-copy puts the transcript on the clipboard; the app then sends a
@@ -63,7 +70,7 @@
           export LD_LIBRARY_PATH=/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
           # -u because stdout is a pipe to the journal, and Python would
           # otherwise block-buffer every diagnostic into invisibility.
-          exec ${pythonEnv}/bin/python -u ${./main.py} "$@"
+          exec ${pythonEnv}/bin/python -u ${src}/main.py "$@"
         '';
       };
     in
